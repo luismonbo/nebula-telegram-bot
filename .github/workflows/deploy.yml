@@ -14,7 +14,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: 'Checkout repository'
@@ -40,6 +39,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BUILD_ARTIFACT_NAME }}
+          include-hidden-files: true
           path: |
             .
             !.git
@@ -56,6 +56,9 @@ jobs:
           name: ${{ env.BUILD_ARTIFACT_NAME }}
           path: downloaded-artifact
 
+      - name: 'Restore executable bit on ffmpeg/ffprobe'
+        run: chmod +x downloaded-artifact/ffmpeg downloaded-artifact/ffprobe
+
       - name: 'Log in to Azure via OIDC'
         uses: azure/login@v3
         with:
@@ -68,3 +71,4 @@ jobs:
         with:
           app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
           package: downloaded-artifact
+          respect-funcignore: true
