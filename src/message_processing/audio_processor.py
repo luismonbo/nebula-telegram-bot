@@ -84,11 +84,13 @@ class AudioProcessor:
 
     async def process_audio_message(self, message, token):
         # Extract audio file details from the message
-        logging.info(f"Processing message: {message}")
         audio = message.get("audio")
         voice = message.get("voice")
         audio_file_id = audio.get("file_id") if audio else voice.get("file_id")
         chat_id = message.get("chat", {}).get("id", "No chat id")
+        logging.info(
+            f"Processing audio message_id={message.get('message_id')} chat_id={chat_id}"
+        )
         timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y%m%d%H%M%S"
         )

@@ -100,10 +100,12 @@ class MessageHandler:
 
         try:
             chat_id = message["chat"]["id"]
-            logging.info(f"Received audio message {message}")
             audio = message.get("audio", message.get("voice", {}))
             duration = audio.get("duration", 0)
             file_id = audio["file_id"]
+            logging.info(
+                f"Received audio message_id={message.get('message_id')} chat_id={chat_id} duration={duration}"
+            )
             max_audio_duration = 10 * 60
             summarization_threshold = 250
 

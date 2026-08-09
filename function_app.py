@@ -41,12 +41,14 @@ async def telegram_bot_function(req: func.HttpRequest) -> func.HttpResponse:
         req_body = req.get_json()
 
         # Check if user in db
-        username = req_body.get("message").get("from", {}).get("username", {})
-        chat_id = req_body.get("message").get("chat").get("id")
+        message = req_body.get("message", {})
+        username = message.get("from", {}).get("username")
+        chat_id = message.get("chat", {}).get("id")
 
-        logging.info(f"Received message from {username}: {req_body}")
-        logging.info(user_db.get_user(username))
-        if user_db.get_user(username):
+        logging.info(
+            f"Received message_id={message.get('message_id')} chat_id={chat_id}"
+        )
+        if username and user_db.get_user(username):
             response_message = await message_handler.handle_update(req_body)
             return response_message
         else:
