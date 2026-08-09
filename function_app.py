@@ -25,11 +25,17 @@ message_handler = MessageHandler(
 
 app = func.FunctionApp()
 
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+
 
 @app.function_name("TelegramBotFunction")
-@app.route(route="nebula", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="nebula", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 async def telegram_bot_function(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Python HTTP trigger function received a request from Telegram Bot.")
+
+    if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+        logging.warning("Rejected webhook request with missing/invalid secret token.")
+        return func.HttpResponse("Unauthorized", status_code=401)
 
     try:
         req_body = req.get_json()
