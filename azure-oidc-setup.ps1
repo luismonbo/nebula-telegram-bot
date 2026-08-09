@@ -8,13 +8,14 @@
 # AZURE_SUBSCRIPTION_ID. See docs/superpowers/specs/2026-08-09-github-actions-cicd-design.md.
 
 $IdentityName = "nebula-github-deploy"
-$ResourceGroup = "<RESOURCE_GROUP>"
-$FunctionAppName = "<FUNCTION_APP_NAME>"
-$GitHubOrg = "<GITHUB_ORG>"
-$GitHubRepo = "<REPO_NAME>"
+$ResourceGroup = "telegram-bot-dev"
+$FunctionAppName = "nebula-telegram-bot"
+$GitHubOrg = "luismonbo"
+$GitHubRepo = "nebula-telegram-bot"
 $Branch = "main"
+$Location = "westeurope"
 
-az identity create --name $IdentityName --resource-group $ResourceGroup `
+az identity create --name $IdentityName --resource-group $ResourceGroup --location $Location `
     --query "{clientId: clientId, tenantId: tenantId}" -o table
 if ($LASTEXITCODE -ne 0) { throw "az identity create failed" }
 

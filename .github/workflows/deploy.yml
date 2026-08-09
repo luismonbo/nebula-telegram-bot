@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_NAME: 'REPLACE_WITH_FUNCTION_APP_NAME' # TODO: set to your Function App's name in Azure
+  AZURE_FUNCTIONAPP_NAME: 'nebula-telegram-bot'
   PYTHON_VERSION: '3.10'
   BUILD_ARTIFACT_NAME: 'nebula-function-package'
 
