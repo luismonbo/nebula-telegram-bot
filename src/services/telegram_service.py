@@ -56,7 +56,9 @@ class TelegramService:
                 data["reply_to_message_id"] = reply_to_message_id
 
             response = await self._make_request("sendMessage", data)
-            return response["result"]["message_id"] if response else None
+            if response and response.get("ok"):
+                return response["result"]["message_id"]
+            return None
 
         except Exception as e:
             logging.error(f"Error sending message: {str(e)}")
@@ -88,11 +90,21 @@ class TelegramService:
 
             response = await self._make_request("editMessageText", data)
 
-            # Handle the case where message content hasn't changed
-            if not response and self._is_message_unchanged_error():
+            if response and response.get("ok"):
+                return response["result"]["message_id"]
+
+            description = (response or {}).get("description", "")
+
+            # Telegram returns this specific error when the new text is identical
+            # to what's already there - a benign no-op, not a real failure.
+            if self._is_message_unchanged_error(description):
                 return message_id
 
-            return response["result"]["message_id"] if response else None
+            logging.error(
+                f"Failed to edit message {message_id}: "
+                f"{description or 'no response from Telegram API'}"
+            )
+            return None
 
         except Exception as e:
             logging.error(f"Error editing message: {str(e)}")
@@ -173,26 +185,23 @@ class TelegramService:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=data) as response:
                     self.last_request_time = datetime.now()
+                    body = await response.json()
 
                     if response.status != 200:
-                        logging.error(
-                            f"Telegram API error: {response.status} - {await response.text()}"
-                        )
-                        return None
+                        logging.error(f"Telegram API error: {response.status} - {body}")
 
-                    return await response.json()
+                    return body
 
         except Exception as e:
             logging.error(f"Error making request to Telegram: {str(e)}")
             return None
 
-    def _is_message_unchanged_error(self) -> bool:
+    def _is_message_unchanged_error(self, description: str) -> bool:
         """
-        Check if the last error was due to message content being unchanged.
-        This is a common case when editing messages and not an actual error.
+        Check if a Telegram API error description indicates the message content
+        was unchanged. This is a common, benign case when editing messages.
         """
-        # You might want to implement more sophisticated error checking here
-        return True
+        return "message is not modified" in description.lower()
 
     def format_telegram_html(self, text):
         """
