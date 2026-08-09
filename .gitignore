@@ -5,7 +5,6 @@ tests/*
 __pycache__/
 *.py[cod]
 *$py.class
-host.json
 local.settings.json
 .DS_Store
 # C extensions
@@ -142,3 +141,7 @@ __blobstorage__
 __queuestorage__
 __azurite_db*__.json
 .python_packages
+
+# Claude Code
+.claude
+docs/superpowers
