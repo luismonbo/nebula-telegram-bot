@@ -7,14 +7,13 @@ on:
 
 env:
   AZURE_FUNCTIONAPP_NAME: 'nebula-telegram-bot'
-  AZURE_RESOURCE_GROUP: 'telegram-bot-dev'
   PYTHON_VERSION: '3.10'
 
-# Single job on purpose. A remote build ships *source* and lets Oryx install the
-# dependencies inside the real Azure Functions Python image, so there is no
-# pre-built package to hand between jobs. The old build/deploy split also round-
-# tripped the tree through upload-artifact, which dropped the executable bit on
-# ffmpeg/ffprobe (they are tracked as mode 100755, so a plain checkout is enough).
+# Single job on purpose. Oryx installs dependencies server-side from source, so
+# there is no prebuilt package to hand between jobs. The old build/deploy split
+# also round-tripped the tree through upload/download-artifact, which stripped the
+# executable bit off ffmpeg/ffprobe (tracked as mode 100755, so a plain checkout
+# already has it) and needed a compensating chmod.
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -41,9 +40,6 @@ jobs:
 
       # TODO: run tests/lint here once they exist (docs/issues/16, docs/issues/17)
 
-      - name: 'Install Azure Functions Core Tools'
-        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
-
       - name: 'Log in to Azure via OIDC'
         uses: azure/login@v3
         with:
@@ -51,29 +47,19 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # local.settings.json is gitignored, so a CI checkout has no copy. Core Tools
-      # reads FUNCTIONS_WORKER_RUNTIME from it to decide the project is Python;
-      # without it the publish fails to determine a worker runtime. Values are
-      # placeholders and never leave the runner: .funcignore excludes this file from
-      # the package, and we deliberately do NOT pass --publish-local-settings / -i,
-      # which would overwrite the app's real settings with these placeholders.
-      - name: 'Synthesize local.settings.json for runtime detection'
-        run: |
-          cat > local.settings.json <<'EOF'
-          {
-            "IsEncrypted": false,
-            "Values": {
-              "AzureWebJobsStorage": "",
-              "FUNCTIONS_WORKER_RUNTIME": "python"
-            }
-          }
-          EOF
-
-      # Mirrors ./deploy-function.ps1. --build remote is the default on Linux
-      # Consumption but is stated explicitly so a Core Tools default change cannot
-      # silently turn this back into a local build.
-      - name: 'Publish to Azure Functions (remote build)'
-        run: |
-          func azure functionapp publish "$AZURE_FUNCTIONAPP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --build remote
+      # Deliberately NO `pip install --target .python_packages/lib/site-packages`
+      # step: that builds wheels on a generic ubuntu-latest runner instead of the
+      # Azure Functions Python image, which is what shipped a package the app could
+      # not run. scm-do-build-during-deployment + enable-oryx-build hand the build to
+      # Kudu/Oryx instead. Both are required together -- either one alone is a no-op.
+      #
+      # `remote-build` is NOT set: per the Azure Functions docs support matrix it
+      # applies only to Flex Consumption, and this app is on a Y1 Consumption plan.
+      - name: 'Deploy to Azure Functions (Oryx remote build)'
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          package: '.'
+          respect-funcignore: true
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
