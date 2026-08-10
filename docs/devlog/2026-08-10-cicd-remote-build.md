@@ -64,6 +64,28 @@ locally but is off the supported CI path, and installing Core Tools on the runne
 - The remaining option was a pinned ~553 MB GitHub release zip per run (no `min` variant
   exists for linux-x64).
 
+## Removed the `asyncio` dependency (separate real bug)
+
+`pyproject.toml` listed `asyncio>=3.4.3`, so `uv export` emitted `asyncio==3.4.3` and
+`pip install --target` dropped it into `.python_packages/lib/site-packages`. The PyPI
+`asyncio` package is a **2015 backport of the stdlib module for Python 3.3**, and `async`
+became a reserved keyword in 3.7. Reproduced on CPython 3.10 with the package dir ahead
+of stdlib on `sys.path`:
+
+```
+File "asyncio/base_events.py", line 296
+    future = tasks.async(future, loop=self)
+                   ^^^^^
+SyntaxError: invalid syntax
+```
+
+An unparseable `asyncio` breaks every transitive `import asyncio` (aiohttp, langchain, the
+Functions worker itself), so no decorators run and no functions register. Whether it
+actually bites depends on whether the worker prepends or appends
+`.python_packages/lib/site-packages` to `sys.path` — which would also explain why the
+Oryx/remote-build path survives it. Mechanism confirmed, causal role in our failures not
+confirmed. Removed from `pyproject.toml`, `uv.lock`, and `requirements.txt` regardless.
+
 ## Open
 
 - **Linux Consumption is planned for retirement** (flagged in the deployment-method table).
