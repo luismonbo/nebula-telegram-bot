@@ -81,6 +81,19 @@ real `asyncio` for every transitive importer (aiohttp, langchain, the worker its
   upload/download-artifact, stripping the exec bit off `ffmpeg`/`ffprobe`, and it omits
   `include-hidden-files: true`, which would silently drop the hidden `.python_packages`.
 
+## Simplification (after the fix was confirmed working)
+
+Dropped the `uv` install + `uv export` steps from CI. To avoid losing the pinning they
+provided, `requirements.txt` was regenerated once from `uv.lock` and committed fully
+pinned (248 lines, `cryptography==44.0.1`). This matters because `cryptography` arrives
+transitively via `azure-identity`, which the previous hand-maintained file left
+unpinned — exactly the surface that caused the glibc failure. **Consequence: after any
+dependency change, regenerate it manually** (`uv export --format requirements-txt
+--no-hashes --no-emit-project -o requirements.txt`), since CI no longer does.
+
+Kept the smoke test and the post-deploy verification: both are what convert a silently
+broken deploy into a red run.
+
 ## Open
 
 - **Linux Consumption is planned for retirement.** Migrating to Flex Consumption would give

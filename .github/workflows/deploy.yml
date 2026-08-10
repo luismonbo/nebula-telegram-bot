@@ -8,117 +8,68 @@ on:
 env:
   AZURE_FUNCTIONAPP_NAME: 'nebula-telegram-bot'
   AZURE_RESOURCE_GROUP: 'telegram-bot-dev'
-  # Must match the app's runtime (linuxFxVersion = Python|3.10) and the Dockerfile
-  # base image. Dependencies are resolved *inside* this image so the wheels can
-  # actually load on the app -- see the build step below.
   FUNCTIONS_IMAGE: 'mcr.microsoft.com/azure-functions/python:4-python3.10'
 
-# Single job on purpose. The documented Python template splits build/deploy and
-# hands the tree over via upload/download-artifact, but that round-trip strips the
-# executable bit off ffmpeg/ffprobe (tracked as mode 100755, so a plain checkout
-# already has it) and the template omits `include-hidden-files: true`, which would
-# silently drop the hidden .python_packages directory holding every dependency.
 jobs:
   deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write # Required for OIDC
-      contents: read # Required for actions/checkout
+      id-token: write
+      contents: read
     steps:
-      - name: 'Checkout repository'
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-      # No actions/setup-python step: the interpreter that resolves and installs
-      # dependencies is the one inside FUNCTIONS_IMAGE, not the runner's.
-      - name: 'Install uv'
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-
-      - name: 'Regenerate requirements.txt from uv.lock'
-        run: uv export --format requirements-txt --no-hashes --no-emit-project -o requirements.txt
-
-      # This app is on Y1 Linux Consumption, which deploys via *external package URL*
-      # (WEBSITE_RUN_FROM_PACKAGE + SAS blob). That path has no Kudu build step, so
-      # remote-build / scm-do-build-during-deployment / enable-oryx-build cannot apply
-      # and are silently ignored -- the workflow is the only place the build can happen.
-      #
-      # It must not happen on the runner, though. ubuntu-latest has glibc 2.39, so pip
-      # there resolves e.g. cryptography as manylinux_2_34, which cannot load on the
-      # Functions image (Debian 11, glibc 2.31): the worker fails to import, no
-      # decorators run, and the app registers zero functions while the deploy still
-      # reports success. Running pip inside the target image is what `func publish`
-      # achieves via Oryx, and it picks wheels the app can actually load.
-      - name: 'Install project dependencies inside the Azure Functions runtime image'
+      # Must run inside FUNCTIONS_IMAGE: pip on the runner resolves wheels against
+      # glibc 2.39 that cannot load on the app (Debian 11, glibc 2.31).
+      - name: Install dependencies in the Functions runtime image
         run: |
           docker run --rm -v "$PWD:/w" -w /w \
             --entrypoint /bin/bash "$FUNCTIONS_IMAGE" -c '
-              set -euo pipefail
+              set -e
               python -m pip install --upgrade pip
               pip install --no-cache-dir -r requirements.txt \
                 --target .python_packages/lib/site-packages
             '
           sudo chown -R "$(id -u):$(id -g)" .python_packages
 
-      # Fail here rather than after a "successful" deploy. This catches both failure
-      # modes we hit: an ABI/glibc-incompatible wheel, and a PyPI package shadowing a
-      # stdlib module (the asyncio backport, which is unparseable on 3.10).
-      - name: 'Smoke-test the built dependencies in the runtime image'
+      - name: Smoke-test dependencies
         run: |
           cat > smoke_test.py <<'EOF'
           import asyncio
-
-          assert "site-packages" not in asyncio.__file__, (
-              "stdlib asyncio is shadowed by " + asyncio.__file__
-          )
-
-          import aiohttp
-          import azure.functions
-          import cryptography
-          import langchain_openai
-          import openai
-          import pydub
-
-          print("dependency imports OK; asyncio resolved from", asyncio.__file__)
+          assert "site-packages" not in asyncio.__file__, asyncio.__file__
+          import aiohttp, azure.functions, cryptography, langchain_openai, openai, pydub
+          print("imports OK")
           EOF
           docker run --rm -v "$PWD:/w" -w /w \
             -e PYTHONPATH=/w/.python_packages/lib/site-packages \
-            --entrypoint /bin/bash "$FUNCTIONS_IMAGE" \
-            -c "python /w/smoke_test.py"
+            --entrypoint /bin/bash "$FUNCTIONS_IMAGE" -c "python /w/smoke_test.py"
           rm smoke_test.py
 
-      # TODO: run tests/lint here once they exist (docs/issues/16, docs/issues/17)
-
-      - name: 'Log in to Azure via OIDC'
-        uses: azure/login@v3
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: 'Deploy to Azure Functions'
-        uses: Azure/functions-action@v1
-        id: deploy-to-function-app
+      - uses: Azure/functions-action@v1
         with:
           app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
           package: '.'
           respect-funcignore: true
 
-      # A successful deploy is not the same as a working app: a worker that fails to
-      # import registers no functions while the deploy still reports success.
-      - name: 'Verify functions are registered'
+      # A green deploy does not mean a working app: a worker that fails to import
+      # registers no functions while the deploy still reports success.
+      - name: Verify functions are registered
         run: |
           for i in $(seq 1 10); do
-            count=$(az functionapp function list \
-              -n "$AZURE_FUNCTIONAPP_NAME" -g "$AZURE_RESOURCE_GROUP" \
-              --query "length(@)" -o tsv 2>/dev/null || echo 0)
-            if [ "${count:-0}" -gt 0 ]; then
-              echo "OK: $count function(s) registered"
-              az functionapp function list \
-                -n "$AZURE_FUNCTIONAPP_NAME" -g "$AZURE_RESOURCE_GROUP" \
-                --query "[].name" -o tsv
+            n=$(az functionapp function list -n "$AZURE_FUNCTIONAPP_NAME" \
+              -g "$AZURE_RESOURCE_GROUP" --query "length(@)" -o tsv 2>/dev/null || echo 0)
+            if [ "${n:-0}" -gt 0 ]; then
+              echo "OK: $n function(s) registered"
               exit 0
             fi
-            echo "attempt $i: no functions registered yet, waiting..."
+            echo "attempt $i: none yet, waiting..."
             sleep 15
           done
-          echo "FAILED: no functions registered - the worker probably could not import function_app.py"
+          echo "FAILED: no functions registered"
           exit 1
