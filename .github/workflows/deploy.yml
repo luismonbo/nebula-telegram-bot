@@ -7,11 +7,18 @@ on:
 
 env:
   AZURE_FUNCTIONAPP_NAME: 'nebula-telegram-bot'
+  AZURE_RESOURCE_GROUP: 'telegram-bot-dev'
   PYTHON_VERSION: '3.10'
+  # Pinned. The npm package (azure-functions-core-tools@4) cannot be used: its
+  # post-install fetches a CDN zip for a CLI build newer than any published
+  # release and gets a 404. The Microsoft apt feed has no
+  # azure-functions-core-tools-4 package for noble or jammy either.
+  FUNC_CLI_VERSION: '4.12.1'
 
-# Single job on purpose. Oryx installs dependencies server-side from source, so
-# there is no prebuilt package to hand between jobs. The old build/deploy split
-# also round-tripped the tree through upload/download-artifact, which stripped the
+# Single job on purpose. A remote build ships *source* and lets Oryx install the
+# dependencies inside the real Azure Functions Python image, so there is no
+# prebuilt package to hand between jobs. The old build/deploy split also
+# round-tripped the tree through upload/download-artifact, which stripped the
 # executable bit off ffmpeg/ffprobe (tracked as mode 100755, so a plain checkout
 # already has it) and needed a compensating chmod.
 jobs:
@@ -40,6 +47,30 @@ jobs:
 
       # TODO: run tests/lint here once they exist (docs/issues/16, docs/issues/17)
 
+      - name: 'Cache Azure Functions Core Tools'
+        id: func-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/func-cli
+          key: func-cli-linux-x64-${{ env.FUNC_CLI_VERSION }}
+
+      - name: 'Install Azure Functions Core Tools'
+        if: steps.func-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/func.zip \
+            "https://github.com/Azure/azure-functions-core-tools/releases/download/${FUNC_CLI_VERSION}/Azure.Functions.Cli.linux-x64.${FUNC_CLI_VERSION}.zip"
+          mkdir -p "$HOME/func-cli"
+          unzip -q /tmp/func.zip -d "$HOME/func-cli"
+
+      - name: 'Put func on PATH'
+        run: |
+          chmod +x "$HOME/func-cli/func"
+          if [ -f "$HOME/func-cli/gozip" ]; then chmod +x "$HOME/func-cli/gozip"; fi
+          echo "$HOME/func-cli" >> "$GITHUB_PATH"
+
+      - name: 'Verify Core Tools'
+        run: func --version
+
       - name: 'Log in to Azure via OIDC'
         uses: azure/login@v3
         with:
@@ -47,19 +78,57 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Deliberately NO `pip install --target .python_packages/lib/site-packages`
-      # step: that builds wheels on a generic ubuntu-latest runner instead of the
-      # Azure Functions Python image, which is what shipped a package the app could
-      # not run. scm-do-build-during-deployment + enable-oryx-build hand the build to
-      # Kudu/Oryx instead. Both are required together -- either one alone is a no-op.
+      # local.settings.json is gitignored, so a CI checkout has no copy. Core Tools
+      # reads FUNCTIONS_WORKER_RUNTIME from it to decide the project is Python;
+      # without it the publish cannot determine a worker runtime. Values are
+      # placeholders and never leave the runner: .funcignore excludes this file from
+      # the package, and we deliberately do NOT pass --publish-local-settings / -i,
+      # which would overwrite the app's real settings with these placeholders.
+      - name: 'Synthesize local.settings.json for runtime detection'
+        run: |
+          cat > local.settings.json <<'EOF'
+          {
+            "IsEncrypted": false,
+            "Values": {
+              "AzureWebJobsStorage": "",
+              "FUNCTIONS_WORKER_RUNTIME": "python"
+            }
+          }
+          EOF
+
+      # Mirrors ./deploy-function.ps1, which is the only mechanism proven to work on
+      # this app. Azure/functions-action cannot remote-build here: on Linux
+      # Consumption with RBAC it hard-routes to the WEBSITE_RUN_FROM_PACKAGE blob
+      # path, which has no Kudu build step, so scm-do-build-during-deployment and
+      # enable-oryx-build are silently ignored. Deploying source without a build that
+      # way leaves the app with no dependencies and zero registered functions.
       #
-      # `remote-build` is NOT set: per the Azure Functions docs support matrix it
-      # applies only to Flex Consumption, and this app is on a Y1 Consumption plan.
-      - name: 'Deploy to Azure Functions (Oryx remote build)'
-        uses: Azure/functions-action@v1
-        with:
-          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-          package: '.'
-          respect-funcignore: true
-          scm-do-build-during-deployment: true
-          enable-oryx-build: true
+      # --build remote is the default on Linux Consumption but is stated explicitly
+      # so a Core Tools default change cannot silently turn this into a local build.
+      - name: 'Publish to Azure Functions (remote build)'
+        run: |
+          func azure functionapp publish "$AZURE_FUNCTIONAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --build remote
+
+      # A successful publish is not the same as a working app: a Python worker that
+      # fails to import registers no functions while the deploy still reports success.
+      - name: 'Verify functions are registered'
+        run: |
+          set -o pipefail
+          for i in $(seq 1 10); do
+            count=$(az functionapp function list \
+              -n "$AZURE_FUNCTIONAPP_NAME" -g "$AZURE_RESOURCE_GROUP" \
+              --query "length(@)" -o tsv 2>/dev/null || echo 0)
+            if [ "${count:-0}" -gt 0 ]; then
+              echo "OK: $count function(s) registered"
+              az functionapp function list \
+                -n "$AZURE_FUNCTIONAPP_NAME" -g "$AZURE_RESOURCE_GROUP" \
+                --query "[].name" -o tsv
+              exit 0
+            fi
+            echo "attempt $i: no functions registered yet, waiting..."
+            sleep 15
+          done
+          echo "FAILED: no functions registered after deploy - the worker probably could not import function_app.py"
+          exit 1
