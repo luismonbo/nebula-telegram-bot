@@ -8,14 +8,16 @@ on:
 env:
   AZURE_FUNCTIONAPP_NAME: 'nebula-telegram-bot'
   AZURE_RESOURCE_GROUP: 'telegram-bot-dev'
-  PYTHON_VERSION: '3.10'
+  # Must match the app's runtime (linuxFxVersion = Python|3.10) and the Dockerfile
+  # base image. Dependencies are resolved *inside* this image so the wheels can
+  # actually load on the app -- see the build step below.
+  FUNCTIONS_IMAGE: 'mcr.microsoft.com/azure-functions/python:4-python3.10'
 
 # Single job on purpose. The documented Python template splits build/deploy and
 # hands the tree over via upload/download-artifact, but that round-trip strips the
 # executable bit off ffmpeg/ffprobe (tracked as mode 100755, so a plain checkout
 # already has it) and the template omits `include-hidden-files: true`, which would
 # silently drop the hidden .python_packages directory holding every dependency.
-# Building and deploying in one job avoids both problems.
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -26,26 +28,62 @@ jobs:
       - name: 'Checkout repository'
         uses: actions/checkout@v6
 
-      - name: 'Set up Python version: ${{ env.PYTHON_VERSION }}'
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
+      # No actions/setup-python step: the interpreter that resolves and installs
+      # dependencies is the one inside FUNCTIONS_IMAGE, not the runner's.
       - name: 'Install uv'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: 'Regenerate requirements.txt from uv.lock'
         run: uv export --format requirements-txt --no-hashes --no-emit-project -o requirements.txt
 
-      # This app is on a Y1 Linux Consumption plan, which deploys via *external
-      # package URL* (WEBSITE_RUN_FROM_PACKAGE + SAS blob). That path has no Kudu
-      # build step, so remote-build / scm-do-build-during-deployment /
-      # enable-oryx-build cannot apply and are silently ignored -- deleting this
-      # step ships source with no dependencies, the worker fails to import
-      # function_app.py, and the app registers zero functions while the deploy
-      # still reports success. The workflow is the only place the build can happen.
-      - name: 'Install project dependencies'
-        run: pip install -r requirements.txt --target ".python_packages/lib/site-packages"
+      # This app is on Y1 Linux Consumption, which deploys via *external package URL*
+      # (WEBSITE_RUN_FROM_PACKAGE + SAS blob). That path has no Kudu build step, so
+      # remote-build / scm-do-build-during-deployment / enable-oryx-build cannot apply
+      # and are silently ignored -- the workflow is the only place the build can happen.
+      #
+      # It must not happen on the runner, though. ubuntu-latest has glibc 2.39, so pip
+      # there resolves e.g. cryptography as manylinux_2_34, which cannot load on the
+      # Functions image (Debian 11, glibc 2.31): the worker fails to import, no
+      # decorators run, and the app registers zero functions while the deploy still
+      # reports success. Running pip inside the target image is what `func publish`
+      # achieves via Oryx, and it picks wheels the app can actually load.
+      - name: 'Install project dependencies inside the Azure Functions runtime image'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            --entrypoint /bin/bash "$FUNCTIONS_IMAGE" -c '
+              set -euo pipefail
+              python -m pip install --upgrade pip
+              pip install --no-cache-dir -r requirements.txt \
+                --target .python_packages/lib/site-packages
+            '
+          sudo chown -R "$(id -u):$(id -g)" .python_packages
+
+      # Fail here rather than after a "successful" deploy. This catches both failure
+      # modes we hit: an ABI/glibc-incompatible wheel, and a PyPI package shadowing a
+      # stdlib module (the asyncio backport, which is unparseable on 3.10).
+      - name: 'Smoke-test the built dependencies in the runtime image'
+        run: |
+          cat > smoke_test.py <<'EOF'
+          import asyncio
+
+          assert "site-packages" not in asyncio.__file__, (
+              "stdlib asyncio is shadowed by " + asyncio.__file__
+          )
+
+          import aiohttp
+          import azure.functions
+          import cryptography
+          import langchain_openai
+          import openai
+          import pydub
+
+          print("dependency imports OK; asyncio resolved from", asyncio.__file__)
+          EOF
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e PYTHONPATH=/w/.python_packages/lib/site-packages \
+            --entrypoint /bin/bash "$FUNCTIONS_IMAGE" \
+            -c "python /w/smoke_test.py"
+          rm smoke_test.py
 
       # TODO: run tests/lint here once they exist (docs/issues/16, docs/issues/17)
 
@@ -64,9 +102,8 @@ jobs:
           package: '.'
           respect-funcignore: true
 
-      # A successful deploy is not the same as a working app: a Python worker that
-      # fails to import registers no functions while the deploy still reports
-      # success. That gap hid the breakage across three runs, so fail loudly here.
+      # A successful deploy is not the same as a working app: a worker that fails to
+      # import registers no functions while the deploy still reports success.
       - name: 'Verify functions are registered'
         run: |
           for i in $(seq 1 10); do

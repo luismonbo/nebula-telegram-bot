@@ -1,76 +1,43 @@
-# CI/CD deploy: why remote build is impossible on this plan
+# CI/CD deploy: green pipeline, zero registered functions
 
 **Related:** [2026-08-09-cicd-pipeline.md](2026-08-09-cicd-pipeline.md)
 
-## Verified Azure facts (some assumptions were wrong)
+## Symptom
 
-- Resource group is `telegram-bot-dev`, not `telegram-bot-devs`.
-- Plan is `Y1` / `Dynamic`, `kind: functionapp,linux`, `Python|3.10` → **Linux Consumption**.
-- SCM basic publishing credentials are **disabled** (`allow: false`).
-- CI service principal has **Website Contributor** scoped to the site; local dev is Owner.
-- `ffmpeg` / `ffprobe` are tracked as mode `100755`, so a checkout already has the exec bit.
+Every run reported success; the portal showed no functions. `az functionapp function list`
+returned `[]`. A worker that fails to import registers no functions, and the blob upload
+genuinely succeeded, so nothing went red.
 
-## Key finding
+## Root cause (two independent defects)
 
-Per the Azure Functions GitHub Actions docs, deployment method by plan:
+Settled by downloading the deployed package via the SAS URL in
+`WEBSITE_RUN_FROM_PACKAGE` and inspecting it. The package itself was well-formed —
+`function_app.py`, `host.json`, `src/` (25 entries), `.python_packages/lib/site-packages`
+(11,087 entries), `azure/functions/__init__.py` present.
 
-| Hosting plan | Deployment method |
-| --- | --- |
-| Flex Consumption | One deploy |
-| Elastic Premium / Dedicated | Zip deploy |
-| **Consumption** | Windows: Zip deploy · **Linux: external package URL** |
+**1. Wheels resolved for the wrong platform.** `pip install --target` ran on
+`ubuntu-latest` (glibc 2.39), so it picked wheels the app cannot load. From the deployed
+`.dist-info/WHEEL` files:
 
-Linux Consumption deploys via **external package URL** (`WEBSITE_RUN_FROM_PACKAGE` +
-SAS blob). That path has **no Kudu build step**, so `remote-build`,
-`scm-do-build-during-deployment`, and `enable-oryx-build` cannot apply. The parameter
-matrix lists the latter two as "Optional" for Consumption, but that covers the
-Windows/zip-deploy case — on Linux they are silently ignored.
+```
+cryptography    cp39-abi3-manylinux_2_34_x86_64     <-- needs glibc >= 2.34
+pydantic_core   cp310-cp310-manylinux_2_17_x86_64
+numpy           cp310-cp310-manylinux_2_17_x86_64
+```
 
-Proof: after a run with both set to `true`, `WEBSITE_RUN_FROM_PACKAGE` held a SAS blob
-URL while `SCM_DO_BUILD_DURING_DEPLOYMENT` and `ENABLE_ORYX_BUILD` were never written to
-app settings at all, and `az functionapp function list` returned `[]`.
+`mcr.microsoft.com/azure-functions/python:4-python3.10` is Debian 11 → **glibc 2.31**, so
+the `cryptography` `.so` cannot load. `azure-identity`, `azure-storage-blob`, and `msal`
+all import it, and `function_app.py` pulls all three in.
 
-**Therefore the build must happen in the workflow.** Removing
-`pip install --target .python_packages/lib/site-packages` ships source with no
-dependencies; the Python worker cannot import `function_app.py`, no decorators run, and
-the app registers **zero functions while the deploy still reports success**.
+**This is why `./deploy-function.ps1` works and CI did not.** Oryx runs `pip` inside the
+Functions image, so it resolves loadable wheels. The runner resolves ones it can't. The
+asymmetry was the clue that broke the case open.
 
-## Decision
-
-Use the documented approach: build in the workflow with `pip install --target`, deploy
-with `Azure/functions-action@v1`. Deviations from the doc template, both deliberate:
-
-- **Single job.** The template's build/deploy split hands the tree over via
-  `upload-artifact`/`download-artifact`, which strips the executable bit off
-  `ffmpeg`/`ffprobe` and needs a compensating `chmod`. One job avoids it entirely.
-- **No artifact step at all**, which sidesteps a real bug in the doc's Python template:
-  it omits `include-hidden-files: true`, and `.python_packages` is a *hidden* directory,
-  so copied verbatim `upload-artifact@v4+` silently drops every dependency.
-
-Also added a post-deploy step that polls `az functionapp function list` and fails the run
-if nothing registers. A green deploy is not evidence of a working app — that gap hid this
-across three runs.
-
-### Rejected: Core Tools in CI
-
-Replicating `deploy-function.ps1` (`func azure functionapp publish --build remote`) works
-locally but is off the supported CI path, and installing Core Tools on the runner is hostile:
-
-- `npm install -g azure-functions-core-tools@4` fails — its post-install fetches
-  `cdn.functions.azure.com/.../Azure.Functions.Cli.linux-x64.4.13.2.zip` → **404**; the npm
-  package points at a CLI build newer than any published release (latest is 4.12.1).
-- The Microsoft apt feed has **no** `azure-functions-core-tools-4` package for noble or
-  jammy (checked both `binary-amd64/Packages` indexes directly).
-- The remaining option was a pinned ~553 MB GitHub release zip per run (no `min` variant
-  exists for linux-x64).
-
-## Removed the `asyncio` dependency (separate real bug)
-
-`pyproject.toml` listed `asyncio>=3.4.3`, so `uv export` emitted `asyncio==3.4.3` and
-`pip install --target` dropped it into `.python_packages/lib/site-packages`. The PyPI
-`asyncio` package is a **2015 backport of the stdlib module for Python 3.3**, and `async`
-became a reserved keyword in 3.7. Reproduced on CPython 3.10 with the package dir ahead
-of stdlib on `sys.path`:
+**2. The PyPI `asyncio` backport.** `pyproject.toml` declared `asyncio>=3.4.3`; the PyPI
+package is a 2015 backport of the **stdlib** module for Python 3.3, and `async` became a
+reserved keyword in 3.7. Confirmed in the deployed package: 24 `.py` files but only 21
+`.pyc` — `base_events`, `tasks`, and `windows_events` failed to byte-compile, exactly the
+files using `async` as an identifier. Reproduced locally on CPython 3.10:
 
 ```
 File "asyncio/base_events.py", line 296
@@ -79,22 +46,47 @@ File "asyncio/base_events.py", line 296
 SyntaxError: invalid syntax
 ```
 
-An unparseable `asyncio` breaks every transitive `import asyncio` (aiohttp, langchain, the
-Functions worker itself), so no decorators run and no functions register. Whether it
-actually bites depends on whether the worker prepends or appends
-`.python_packages/lib/site-packages` to `sys.path` — which would also explain why the
-Oryx/remote-build path survives it. Mechanism confirmed, causal role in our failures not
-confirmed. Removed from `pyproject.toml`, `uv.lock`, and `requirements.txt` regardless.
+Since `.python_packages/lib/site-packages` precedes stdlib on `sys.path`, this shadows
+real `asyncio` for every transitive importer (aiohttp, langchain, the worker itself).
+
+## Wrong turns (recorded so they aren't repeated)
+
+- **Chasing a remote build.** Linux Consumption deploys via *external package URL* and has
+  no Kudu build step, so `remote-build` (Flex Consumption only per the docs matrix),
+  `scm-do-build-during-deployment`, and `enable-oryx-build` are all silently ignored.
+  Proof: after setting the latter two, `WEBSITE_RUN_FROM_PACKAGE` held a SAS blob URL while
+  neither setting was ever written to app settings.
+- **Removing the `pip install --target` step** on the assumption Oryx would replace it.
+  Nothing did, which shipped source with no dependencies and emptied the app.
+- **Core Tools in CI.** `npm install -g azure-functions-core-tools@4` fails (post-install
+  CDN 404 for a CLI build newer than any release), and the Microsoft apt feed carries no
+  `azure-functions-core-tools-4` for noble or jammy. Moot anyway — building in the runtime
+  image achieves the same thing.
+- **`az webapp log tail`** returns 404 on Linux Consumption; the plan has no Kudu
+  logstream. App Insights is the only log path.
+
+## Fix
+
+- Removed `asyncio` from `pyproject.toml`, `uv.lock`, and `requirements.txt`.
+- **Dependencies are now installed inside `mcr.microsoft.com/azure-functions/python:4-python3.10`**
+  via `docker run`, so pip resolves wheels against the app's real glibc. This is what
+  Oryx does, without needing Kudu.
+- Dropped `actions/setup-python`: the interpreter that resolves wheels is the image's.
+- Added a **smoke test** that imports `cryptography`, `aiohttp`, `azure.functions`,
+  `langchain_openai`, `openai`, `pydub` inside that image and asserts `asyncio` resolves to
+  stdlib. Catches both defects above before deploying.
+- Added a **post-deploy check** that polls `az functionapp function list` and fails the run
+  if nothing registers. Confirmed working — it is what finally turned a run red.
+- Single job: the doc template's build/deploy split round-trips through
+  upload/download-artifact, stripping the exec bit off `ffmpeg`/`ffprobe`, and it omits
+  `include-hidden-files: true`, which would silently drop the hidden `.python_packages`.
 
 ## Open
 
-- **Linux Consumption is planned for retirement** (flagged in the deployment-method table).
-  Migrating to **Flex Consumption** would make `remote-build: true` work properly and is the
-  real strategic fix — worth planning rather than deferring.
-- A stale `WEBSITE_RUN_FROM_PACKAGE` may still be set from the failed run. Core Tools clears
-  it on manual publishes; if the app serves stale content, delete that setting and republish.
+- **Linux Consumption is planned for retirement.** Migrating to Flex Consumption would give
+  a real `remote-build: true` and remove the cross-platform wheel problem entirely.
+- `docs/` and `tests/` still ship in the package despite `respect-funcignore: true` and
+  `.funcignore` listing them. Harmless weight, not yet diagnosed.
 - `uv export` emits `pytest` and `python-dotenv` because they sit in `[project].dependencies`
-  rather than a dev group. Harmless bloat, but they ship to production — worth moving to
-  `[dependency-groups]` later (relates to docs/issues/15).
-- `deploy-function.ps1` stays as the manual fallback, and is the way to restore service
-  after a bad deploy.
+  rather than a dev group — they ship to production (relates to docs/issues/15).
+- `deploy-function.ps1` stays as the manual fallback and the way to restore service.
